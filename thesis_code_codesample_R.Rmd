@@ -1,0 +1,1673 @@
+---
+title: "Fiscal Policy and Inflation in the Euro Area"
+author: "Distefano, BSE 2026"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5)
+```
+
+# 0. SETUP
+```{r section0_setup}
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+required <- c("eurostat","fixest","tidyverse","zoo","mFilter",
+              "sandwich","modelsummary","ecb","lmtest","ggrepel",
+              "patchwork","scales","kableExtra")
+new_pkgs <- required[!required %in% installed.packages()[,"Package"]]
+if (length(new_pkgs)) install.packages(new_pkgs)
+
+library(eurostat); library(fixest); library(tidyverse); library(zoo)
+library(mFilter);  library(sandwich); library(modelsummary); library(ecb)
+library(lmtest);   library(ggrepel); library(patchwork); library(scales)
+library(kableExtra)
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+EA12         <- c("AT","BE","DE","ES","FI","FR","IE","IT","LU","NL","PT","EL")
+START_DATE   <- "2000-01-01"
+H_QUARTERLY  <- 12
+H_SPF        <- 8
+CI_Z         <- 1
+CI_LABEL     <- "68% CI"
+INPUT_FOLDER <- "C:\\Users\\admin\\Desktop\\MASTER THESIS BSE"
+
+# Sub-period definitions (used throughout)
+SP_BREAKS <- c("2016 Q4","2020 Q1","2022 Q1","2023 Q3","2026 Q1")
+SP_LABELS <- c("Pre-pandemic\n(2016Q4–2019Q4)",
+               "COVID\n(2020Q1–2021Q4)",
+               "Ukraine/peak\n(2022Q1–2023Q2)",
+               "Post-tightening\n(2023Q3–2026Q1)")
+SP_COLORS <- c("#2166ac","#d6604d","#b2182b","#4dac26")
+
+assign_subperiod <- function(yr, qtr) {
+  dplyr::case_when(
+    yr < 2020                                     ~ "Pre-pandemic",
+    yr >= 2020 & yr <= 2021                       ~ "COVID",
+    (yr == 2022) | (yr == 2023 & qtr <= 2)        ~ "Ukraine/peak",
+    TRUE                                          ~ "Post-tightening"
+  )
+}
+
+# Shade helper for context figures
+shade_df <- tibble(
+  xmin  = as.yearqtr(c("2020 Q1","2022 Q1","2023 Q3")),
+  xmax  = as.yearqtr(c("2021 Q4","2023 Q2","2026 Q1")),
+  label = c("COVID","Ukraine/peak","Post-tightening"),
+  fill  = c("#d6604d","#b2182b","#4dac26")
+)
+```
+
+# 1. DATA ASSEMBLY  
+```{r section1_data}
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. DATA ASSEMBLY  (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n[1] Fetching data from Eurostat...\n")
+
+hicp_raw <- get_eurostat("prc_hicp_midx", filters = list(
+  geo = EA12, unit = "I15", coicop = c("CP00","AP")
+))
+hicp <- hicp_raw %>%
+  filter(time >= START_DATE) %>%
+  mutate(quarter = as.yearqtr(time)) %>%
+  group_by(geo, coicop, quarter) %>%
+  summarise(index = mean(values, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = coicop, values_from = index) %>%
+  rename(hicp_headline = CP00, hicp_core = AP) %>%
+  arrange(geo, quarter) %>%
+  group_by(geo) %>%
+  mutate(infl_headline = (hicp_headline / lag(hicp_headline, 4) - 1) * 100,
+         infl_core     = (hicp_core     / lag(hicp_core,     4) - 1) * 100) %>%
+  ungroup()
+
+gdp_real_raw <- get_eurostat("namq_10_gdp", filters = list(
+  geo = EA12, s_adj = "SCA", unit = "CLV10_MEUR", na_item = "B1GQ"
+))
+gdp_real <- gdp_real_raw %>%
+  filter(time >= START_DATE) %>%
+  mutate(quarter = as.yearqtr(time)) %>%
+  select(geo, quarter, real_gdp = values)
+
+gdp_nom_raw <- get_eurostat("namq_10_gdp", filters = list(
+  geo = EA12, s_adj = "NSA", unit = "CP_MEUR", na_item = "B1GQ"
+))
+gdp_nom <- gdp_nom_raw %>%
+  filter(time >= START_DATE) %>%
+  mutate(quarter = as.yearqtr(time)) %>%
+  select(geo, quarter, nom_gdp = values)
+
+deficit_raw <- get_eurostat("gov_10q_ggnfa", filters = list(
+  geo = EA12, sector = "S13", unit = "MIO_EUR", na_item = c("B9","D41PAY")
+))
+debt_raw <- get_eurostat("gov_10q_ggdebt", filters = list(
+  geo = EA12, sector = "S13", unit = "MIO_EUR", na_item = "GD"
+))
+
+fiscal_deficit <- deficit_raw %>%
+  filter(time >= START_DATE) %>%
+  mutate(quarter = as.yearqtr(time)) %>%
+  group_by(geo, quarter, na_item) %>%
+  summarise(values = mean(values, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = na_item, values_from = values)
+
+fiscal_debt <- debt_raw %>%
+  filter(time >= START_DATE) %>%
+  mutate(quarter = as.yearqtr(time)) %>%
+  group_by(geo, quarter) %>%
+  summarise(debt = mean(values, na.rm = TRUE), .groups = "drop")
+
+fiscal <- fiscal_deficit %>%
+  left_join(fiscal_debt, by = c("geo","quarter")) %>%
+  left_join(gdp_nom,     by = c("geo","quarter")) %>%
+  arrange(geo, quarter) %>%
+  group_by(geo) %>%
+  mutate(ann_nom_gdp = zoo::rollsumr(nom_gdp, k = 4, fill = NA)) %>%
+  ungroup() %>%
+  mutate(primary_balance_eur   = B9 + D41PAY,
+         primary_bal_gdp_ratio = (primary_balance_eur / ann_nom_gdp) * 100,
+         debt_gdp_ratio        = (debt / ann_nom_gdp) * 100) %>%
+  select(geo, quarter, primary_bal_gdp_ratio, debt_gdp_ratio, debt)
+
+unemp_raw <- get_eurostat("une_rt_q", filters = list(
+  geo = EA12, sex = "T", age = "Y15-74", unit = "PC_ACT"
+))
+unemp <- unemp_raw %>%
+  filter(time >= START_DATE) %>%
+  mutate(quarter = as.yearqtr(time)) %>%
+  group_by(geo, quarter) %>%
+  summarise(unemp_rate = mean(values, na.rm = TRUE), .groups = "drop")
+
+df_panel <- hicp %>%
+  left_join(gdp_real, by = c("geo","quarter")) %>%
+  left_join(gdp_nom,  by = c("geo","quarter")) %>%
+  left_join(fiscal,   by = c("geo","quarter")) %>%
+  left_join(unemp,    by = c("geo","quarter")) %>%
+  filter(!is.na(infl_headline))
+
+df_panel <- df_panel %>%
+  group_by(geo) %>%
+  mutate(
+    gdp_log  = log(real_gdp),
+    hp_trend = tryCatch(
+      as.numeric(fitted(hpfilter(gdp_log[!is.na(gdp_log)], freq = 1600))),
+      error = function(e) rep(NA_real_, sum(!is.na(gdp_log)))
+    ) %>% { v <- rep(NA_real_, n()); v[!is.na(gdp_log)] <- .; v },
+    output_gap = (gdp_log - hp_trend) * 100
+  ) %>%
+  ungroup()
+
+df_panel <- df_panel %>%
+  arrange(geo, quarter) %>%
+  group_by(geo) %>%
+  mutate(
+    gdp_growth_rate            = (real_gdp / lag(real_gdp, 4) - 1) * 100,
+    d_pb_gdp                   = primary_bal_gdp_ratio - lag(primary_bal_gdp_ratio),
+    infl_core_lag1             = lag(infl_core, 1),
+    infl_headline_lag1         = lag(infl_headline, 1),
+    unemp_rate_lag             = lag(unemp_rate, 1),
+    gdp_growth_rate_lag        = lag(gdp_growth_rate, 1),
+    primary_bal_gdp_ratio_lag  = lag(primary_bal_gdp_ratio, 1),
+    primary_bal_gdp_ratio_lag2 = lag(primary_bal_gdp_ratio, 2),
+    primary_bal_gdp_ratio_lag3 = lag(primary_bal_gdp_ratio, 3),
+    debt_gdp_ratio_lag1        = lag(debt_gdp_ratio, 1),
+    output_gap_lag             = lag(output_gap, 1),
+    d_pb_gdp_lag1              = lag(d_pb_gdp, 1),
+    d_pb_gdp_lag2              = lag(d_pb_gdp, 2)
+  ) %>%
+  ungroup()
+
+cat("  Panel dimensions:", nrow(df_panel), "rows,",
+    n_distinct(df_panel$geo), "countries,",
+    n_distinct(df_panel$quarter), "quarters\n")
+```
+
+# 1b. CONTEXT: DESCRIPTIVE STATISTICS AND PLOTS
+```{r section1b_context_plots}
+# ══════════════════════════════════════════════════════════════════════════════
+# 1b. CONTEXT: DESCRIPTIVE STATISTICS AND PLOTS
+#
+# All graphs use 2016Q1–2026Q1, matching the analysis window.
+# Approach follows Brandão-Marques et al. (2024) and Reis (2026):
+#   (a) EA-aggregate time series — main context
+#   (b) Cross-country panel — outlier detection & heterogeneity
+#   (c) Core/periphery grouping — the standard EMU literature approach
+#       for handling 12 countries without cluttered spaghetti charts
+#
+# ADDITIONAL VARIABLES INCLUDED (beyond the original):
+#   · ECB interest rates (MRO, DFR, MLF)          — monetary policy context
+#   · ECB balance sheet                            — unconventional policy
+#   · Real GDP growth                              — business cycle context
+#   · Output gap                                   — inflationary pressure
+#   · Sovereign spread (IT–DE 10yr)                — fiscal dominance fears
+#   · Dual-axis combined figures (inflation+fiscal)
+#   · Faceted small-multiples (country-level, readable)
+#   · Core vs periphery group aggregates
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (!dir.exists("figures")) {
+  dir.create("figures")
+}
+
+if (!dir.exists("figures/context")) {
+  dir.create("figures/context")
+}
+
+
+cat("\n[1b] Building context figures...\n")
+
+# ── Country labels and group assignments ──────────────────────────────────────
+country_names <- c(AT="Austria", BE="Belgium", DE="Germany", EL="Greece",
+                   ES="Spain",   FI="Finland", FR="France", IE="Ireland",
+                   IT="Italy",   LU="Luxembourg", NL="Netherlands", PT="Portugal")
+
+# Core/periphery split — standard in the EMU literature
+# Core:      DE, FR, NL, FI, AT, LU  (low debt, historically stable)
+# Periphery: IT, ES, PT, EL, IE, BE  (higher debt, debt crisis exposure)
+core_ctry      <- c("DE","FR","NL","FI","AT","LU")
+periphery_ctry <- c("IT","ES","PT","EL","IE","BE")
+
+df_panel <- df_panel %>%
+  mutate(
+    country = country_names[geo],
+    group   = case_when(
+      geo %in% core_ctry      ~ "Core",
+      geo %in% periphery_ctry ~ "Periphery",
+      TRUE                    ~ "Other"
+    )
+  )
+
+# ── EA aggregate (GDP-weighted) — restricted to 2016Q1 onward ─────────────────
+PLOT_START <- as.yearqtr("2016 Q1")
+
+ea_agg <- df_panel %>%
+  filter(!is.na(nom_gdp), quarter >= PLOT_START) %>%
+  group_by(quarter) %>%
+  summarise(
+    core_infl  = weighted.mean(infl_core,             w = nom_gdp, na.rm = TRUE),
+    head_infl  = weighted.mean(infl_headline,         w = nom_gdp, na.rm = TRUE),
+    pb_gdp     = weighted.mean(primary_bal_gdp_ratio, w = nom_gdp, na.rm = TRUE),
+    debt_gdp   = weighted.mean(debt_gdp_ratio,        w = nom_gdp, na.rm = TRUE),
+    unemp      = weighted.mean(unemp_rate,            w = nom_gdp, na.rm = TRUE),
+    gdp_gr     = weighted.mean(gdp_growth_rate,       w = nom_gdp, na.rm = TRUE),
+    output_gap = weighted.mean(output_gap,            w = nom_gdp, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+# ── Helper: add sub-period shading (only shades that fall within plot window) ─
+add_shading <- function(p, start = PLOT_START) {
+  shade_vis <- shade_df %>% filter(xmax >= start)
+  if (nrow(shade_vis) == 0) return(p)
+  p +
+    annotate("rect",
+             xmin  = as.numeric(pmax(shade_vis$xmin, start)),
+             xmax  = as.numeric(shade_vis$xmax),
+             ymin  = -Inf, ymax = Inf,
+             fill  = shade_vis$fill, alpha = 0.10) +
+    annotate("text",
+             x     = as.numeric(pmax(shade_vis$xmin, start)) +
+                       (as.numeric(shade_vis$xmax) -
+                        as.numeric(pmax(shade_vis$xmin, start))) / 2,
+             y     = Inf, vjust = 1.5, size = 2.6,
+             label = shade_vis$label,
+             color = shade_vis$fill)
+}
+
+# ── FIGURE C1: EA headline and core inflation ─────────────────────────────────
+p_infl <- ea_agg %>%
+  select(quarter, core_infl, head_infl) %>%
+  pivot_longer(-quarter, names_to = "series", values_to = "value") %>%
+  mutate(series = recode(series,
+    core_infl = "Core HICP", head_infl = "Headline HICP")) %>%
+  ggplot(aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "black",
+             linewidth = 0.6) +
+  annotate("text", x = as.yearqtr("2016 Q2"), y = 2.35,
+           label = "ECB target (2%)", size = 2.8, hjust = 0) +
+  scale_color_manual(values = c("steelblue","tomato")) +
+  scale_linetype_manual(values = c("solid","dashed")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title = "EA Inflation: Headline and Core (y/y %)",
+       x = NULL, y = "Percent", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+p_infl <- add_shading(p_infl)
+print(p_infl)
+ggsave("figures/context/figC1_ea_inflation.jpg", p_infl, width = 10, height = 5)
+
+# ── FIGURE C2: ECB interest rates ────────────────────────────────────────────
+# Source: ECB SDW — monthly, converted to quarterly averages.
+# MRO  = Main Refinancing Operations Rate
+# DFR  = Deposit Facility Rate
+# MLF  = Marginal Lending Facility Rate
+cat("  Fetching ECB interest rates...\n")
+ecb_rates <- tryCatch({
+  library(ecb)
+  bind_rows(
+    get_data("FM.B.U2.EUR.4F.KR.MRR_FR.LEV") %>%
+      mutate(series = "MRO"),
+    get_data("FM.B.U2.EUR.4F.KR.DFR.LEV") %>%
+      mutate(series = "DFR"),
+    get_data("FM.B.U2.EUR.4F.KR.MLFR.LEV") %>%
+      mutate(series = "MLF")
+  ) %>%
+    mutate(
+      date    = as.Date(paste0(substr(obstime, 1, 7), "-01")),
+      quarter = as.yearqtr(date),
+      rate    = as.numeric(obsvalue)
+    ) %>%
+    filter(quarter >= PLOT_START) %>%
+    group_by(series, quarter) %>%
+    summarise(rate = mean(rate, na.rm = TRUE), .groups = "drop")
+}, error = function(e) {
+  warning("ECB rate fetch failed: ", e$message,
+          "\nFigure C2 will be skipped.")
+  NULL
+})
+
+if (!is.null(ecb_rates)) {
+  p_rates <- ggplot(ecb_rates,
+      aes(x = quarter, y = rate, color = series, linetype = series)) +
+    geom_line(linewidth = 0.9) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50",
+               linewidth = 0.5) +
+    scale_color_manual(
+      values = c(MRO = "steelblue", DFR = "tomato", MLF = "darkgreen"),
+      labels = c(MRO = "Main Refinancing Rate",
+                 DFR = "Deposit Facility Rate",
+                 MLF = "Marginal Lending Facility")) +
+    scale_linetype_manual(
+      values = c(MRO = "solid", DFR = "dashed", MLF = "dotted"),
+      labels = c(MRO = "Main Refinancing Rate",
+                 DFR = "Deposit Facility Rate",
+                 MLF = "Marginal Lending Facility")) +
+    scale_x_yearqtr(format = "%Y", n = 8) +
+    labs(title    = "ECB Key Interest Rates (%)",
+         subtitle = "Quarterly averages of monthly end-of-period rates",
+         x = NULL, y = "Percent", color = NULL, linetype = NULL) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+  p_rates <- add_shading(p_rates)
+  print(p_rates)
+  ggsave("figures/context/figC2_ecb_rates.jpg", p_rates, width = 10, height = 5)
+}
+
+# ── FIGURE C3: ECB Balance Sheet ─────────────────────────────────────────────
+# Source: ECB SDW — weekly total assets of the Eurosystem, converted to
+# quarterly averages and expressed in EUR billions.
+# Series: BSI.M.U2.N.A.T00.A.1.Z5.0000.Z01.E (total assets, EUR millions)
+cat("  Fetching ECB balance sheet...\n")
+ecb_bs <- tryCatch({
+  get_data("BSI.M.U2.N.A.T00.A.1.Z5.0000.Z01.E") %>%
+    mutate(
+      date     = as.Date(paste0(substr(obstime, 1, 7), "-01")),
+      quarter  = as.yearqtr(date),
+      assets_bn = as.numeric(obsvalue) / 1000   # EUR millions → billions
+    ) %>%
+    filter(quarter >= PLOT_START) %>%
+    group_by(quarter) %>%
+    summarise(assets_bn = mean(assets_bn, na.rm = TRUE), .groups = "drop")
+}, error = function(e) {
+  warning("ECB balance sheet fetch failed: ", e$message)
+  NULL
+})
+
+if (!is.null(ecb_bs)) {
+  p_bs <- ggplot(ecb_bs, aes(x = quarter, y = assets_bn)) +
+    geom_area(fill = "steelblue", alpha = 0.3) +
+    geom_line(color = "steelblue", linewidth = 0.9) +
+    scale_x_yearqtr(format = "%Y", n = 8) +
+    scale_y_continuous(labels = scales::comma_format(suffix = " bn")) +
+    labs(title    = "ECB Balance Sheet: Total Eurosystem Assets (EUR billions)",
+         subtitle = "Source: ECB SDW (BSI.M.U2.N.A.T00.A.1.Z5.0000.Z01.E)",
+         x = NULL, y = "EUR billions") +
+    theme_minimal(base_size = 12)
+  p_bs <- add_shading(p_bs)
+  print(p_bs)
+  ggsave("figures/context/figC3_ecb_balance_sheet.jpg", p_bs, width = 10, height = 5)
+}
+
+# ── FIGURE C4: Dual-axis — Inflation + Primary Balance ────────────────────────
+# Right axis: primary balance/GDP (scaled for visual alignment).
+# We use a linear rescaling: scale factor chosen so both series use the
+# full y-range. The second axis is labelled separately so the reader knows
+# which series uses which scale.
+scale_pb <- 0.5   # tune this so the two series roughly fill the same space
+
+p_infl_pb <- ea_agg %>%
+  ggplot(aes(x = quarter)) +
+  geom_line(aes(y = core_infl,  color = "Core inflation",     linetype = "Core inflation"),
+            linewidth = 0.9) +
+  geom_line(aes(y = head_infl,  color = "Headline inflation", linetype = "Headline inflation"),
+            linewidth = 0.9) +
+  geom_col(aes(y = pb_gdp / scale_pb,
+               fill = ifelse(pb_gdp >= 0, "Surplus", "Deficit")),
+           alpha = 0.35, width = 0.22) +
+  geom_hline(yintercept = 2 , linetype = "dashed", color = "black",
+             linewidth = 0.5) +
+  geom_hline(yintercept = 0, color = "grey40", linewidth = 0.4) +
+  scale_y_continuous(
+    name      = "Inflation (y/y %)",
+    sec.axis  = sec_axis(~ . * scale_pb,
+                         name = "Primary Balance / GDP (%)")
+  ) +
+  scale_color_manual(values = c("Core inflation" = "steelblue",
+                                "Headline inflation" = "tomato")) +
+  scale_linetype_manual(values = c("Core inflation" = "solid",
+                                   "Headline inflation" = "dashed")) +
+  scale_fill_manual(values = c("Surplus" = "darkgreen", "Deficit" = "firebrick"),
+                    guide  = "none") +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title    = "EA Inflation and Primary Fiscal Balance",
+       subtitle = "Bars = primary balance/GDP (right axis). Green = surplus, red = deficit.",
+       x = NULL, color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position    = "bottom",
+        axis.title.y.right = element_text(color = "grey30"))
+p_infl_pb <- add_shading(p_infl_pb)
+print(p_infl_pb)
+ggsave("figures/context/figC4_infl_pb_dual.jpg", p_infl_pb, width = 10, height = 5)
+
+# ── FIGURE C5: Dual-axis — Inflation + Debt/GDP ───────────────────────────────
+scale_debt <- 8   # tune: 1pp inflation ≈ 8pp debt/GDP on screen
+
+p_infl_debt <- ea_agg %>%
+  ggplot(aes(x = quarter)) +
+  geom_line(aes(y = core_infl,  color = "Core inflation"),     linewidth = 0.9) +
+  geom_line(aes(y = head_infl,  color = "Headline inflation"), linewidth = 0.9,
+            linetype = "dashed") +
+  geom_line(aes(y = (debt_gdp - 60) / scale_debt,
+                color = "Debt / GDP (right)"),
+            linewidth = 0.9, linetype = "dotdash") +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "black",
+             linewidth = 0.5) +
+  scale_y_continuous(
+    name     = "Inflation (y/y %)",
+    sec.axis = sec_axis(~ . * scale_debt + 60,
+                        name = "Debt / GDP (%)")
+  ) +
+  scale_color_manual(values = c("Core inflation"     = "steelblue",
+                                "Headline inflation" = "tomato",
+                                "Debt / GDP (right)" = "navy")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title    = "EA Inflation and Government Debt",
+       subtitle = "Right axis: Debt/GDP (offset so 60% aligns with zero inflation).",
+       x = NULL, color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position    = "bottom",
+        axis.title.y.right = element_text(color = "navy"))
+p_infl_debt <- add_shading(p_infl_debt)
+print(p_infl_debt)
+ggsave("figures/context/figC5_infl_debt_dual.jpg", p_infl_debt, width = 10, height = 5)
+
+# ── FIGURE C6: Dual-axis — Inflation + Unemployment ───────────────────────────
+scale_u <- 1.5
+
+p_infl_unemp <- ea_agg %>%
+  ggplot(aes(x = quarter)) +
+  geom_line(aes(y = core_infl,  color = "Core inflation"),     linewidth = 0.9) +
+  geom_line(aes(y = head_infl,  color = "Headline inflation"), linewidth = 0.9,
+            linetype = "dashed") +
+  geom_line(aes(y = (unemp - 7) / scale_u,
+                color = "Unemployment (right)"),
+            linewidth = 0.9, linetype = "dotdash") +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "black",
+             linewidth = 0.5) +
+  scale_y_continuous(
+    name     = "Inflation (y/y %)",
+    sec.axis = sec_axis(~ . * scale_u + 7,
+                        name = "Unemployment rate (%)")
+  ) +
+  scale_color_manual(values = c("Core inflation"       = "steelblue",
+                                "Headline inflation"   = "tomato",
+                                "Unemployment (right)" = "purple")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title    = "EA Inflation and Unemployment Rate",
+       subtitle = "Right axis: unemployment rate (offset so 7% aligns with zero inflation).",
+       x = NULL, color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position    = "bottom",
+        axis.title.y.right = element_text(color = "purple"))
+p_infl_unemp <- add_shading(p_infl_unemp)
+print(p_infl_unemp)
+ggsave("figures/context/figC6_infl_unemp_dual.jpg", p_infl_unemp, width = 10, height = 5)
+
+# ── FIGURE C7: Real GDP growth and Output Gap ─────────────────────────────────
+p_gap <- ea_agg %>%
+  select(quarter, gdp_gr, output_gap) %>%
+  pivot_longer(-quarter, names_to = "series", values_to = "value") %>%
+  mutate(series = recode(series,
+    gdp_gr     = "Real GDP growth (y/y %)",
+    output_gap = "Output gap (HP, %)")) %>%
+  ggplot(aes(x = quarter, y = value, color = series, linetype = series)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("steelblue","darkgreen")) +
+  scale_linetype_manual(values = c("solid","dashed")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title    = "EA Real GDP Growth and Output Gap (GDP-weighted)",
+       subtitle = "Output gap computed via HP filter (λ = 1600)",
+       x = NULL, y = "Percent", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+p_gap <- add_shading(p_gap)
+print(p_gap)
+ggsave("figures/context/figC7_gdp_output_gap.jpg", p_gap, width = 10, height = 5)
+
+# ── FIGURE C8: Italian–German sovereign spread (fiscal dominance barometer) ───
+# The IT–DE 10yr spread is the most-watched indicator of fiscal stress in the
+# EA. A widening spread signals that markets price in fiscal dominance risks
+# for peripheral countries. Source: ECB SDW long-term government bond yields.
+cat("  Fetching sovereign yield spread...\n")
+spread_df <- tryCatch({
+  bind_rows(
+    get_data("IRS.M.IT.L.L40.CI.0.EUR.N.Z") %>% mutate(ctry = "IT"),
+    get_data("IRS.M.DE.L.L40.CI.0.EUR.N.Z") %>% mutate(ctry = "DE")
+  ) %>%
+    mutate(
+      date    = as.Date(paste0(substr(obstime, 1, 7), "-01")),
+      quarter = as.yearqtr(date),
+      yield   = as.numeric(obsvalue)
+    ) %>%
+    filter(quarter >= PLOT_START) %>%
+    group_by(ctry, quarter) %>%
+    summarise(yield = mean(yield, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = ctry, values_from = yield) %>%
+    mutate(spread_bp = (IT - DE) * 100)   # basis points
+}, error = function(e) {
+  warning("Sovereign yield fetch failed: ", e$message)
+  NULL
+})
+
+if (!is.null(spread_df)) {
+  p_spread <- ggplot(spread_df, aes(x = quarter, y = spread_bp)) +
+    geom_area(fill = "firebrick", alpha = 0.25) +
+    geom_line(color = "firebrick", linewidth = 0.9) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    scale_x_yearqtr(format = "%Y", n = 8) +
+    labs(title    = "Italy–Germany 10yr Government Bond Spread (basis points)",
+         subtitle = "A rising spread signals fiscal stress / fiscal dominance fears in the periphery",
+         x = NULL, y = "Basis points") +
+    theme_minimal(base_size = 12)
+  p_spread <- add_shading(p_spread)
+  print(p_spread)
+  ggsave("figures/context/figC8_it_de_spread.jpg", p_spread, width = 10, height = 5)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CROSS-COUNTRY ANALYSIS
+# Literature approach for handling 12 countries:
+#   Option 1 — Small multiples (facets, 3×4 grid): each country its own panel,
+#              same scale, easy to scan for outliers. Best for time-series.
+#   Option 2 — Core / periphery group averages: two bold lines instead of 12.
+#              Standard in EMU papers (Erce et al. 2022, Afonso & Jalles 2019).
+#   Option 3 — Summary table: one row per country, key moments. Always included.
+#   Option 4 — Scatter at a point in time: debt vs inflation, labelled dots.
+# We implement all four. The spaghetti line charts are replaced.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── FIGURE C9: Facet — core inflation by country (small multiples) ────────────
+p_infl_facet <- df_panel %>%
+  filter(quarter >= PLOT_START, !is.na(infl_core)) %>%
+  ggplot(aes(x = quarter, y = infl_core)) +
+  geom_line(color = "steelblue", linewidth = 0.6) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "tomato",
+             linewidth = 0.4) +
+  facet_wrap(~ country, ncol = 4) +
+  scale_x_yearqtr(format = "%y", n = 4) +
+  labs(title    = "Core HICP Inflation by Country (y/y %)",
+       subtitle = "Red dashed = ECB 2% target",
+       x = NULL, y = "Percent") +
+  theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(face = "bold"))
+print(p_infl_facet)
+ggsave("figures/context/figC9_core_infl_facets.jpg", p_infl_facet, width = 12, height = 7)
+
+# ── FIGURE C10: Facet — debt/GDP by country ───────────────────────────────────
+p_debt_facet <- df_panel %>%
+  filter(quarter >= PLOT_START, !is.na(debt_gdp_ratio)) %>%
+  ggplot(aes(x = quarter, y = debt_gdp_ratio)) +
+  geom_line(color = "navy", linewidth = 0.6) +
+  geom_hline(yintercept = 60, linetype = "dashed", color = "grey50",
+             linewidth = 0.4) +
+  facet_wrap(~ country, ncol = 4) +
+  scale_x_yearqtr(format = "%y", n = 4) +
+  labs(title    = "Government Debt / GDP by Country (%)",
+       subtitle = "Grey dashed = SGP 60% limit",
+       x = NULL, y = "% of GDP") +
+  theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(face = "bold"))
+print(p_debt_facet)
+ggsave("figures/context/figC10_debt_facets.jpg", p_debt_facet, width = 12, height = 7)
+
+# ── FIGURE C11: Core / Periphery group averages ───────────────────────────────
+# Three panels: core inflation, debt/GDP, primary balance/GDP
+cp_agg <- df_panel %>%
+  filter(quarter >= PLOT_START, group %in% c("Core","Periphery"),
+         !is.na(nom_gdp)) %>%
+  group_by(group, quarter) %>%
+  summarise(
+    core_infl = weighted.mean(infl_core,             w = nom_gdp, na.rm = TRUE),
+    debt_gdp  = weighted.mean(debt_gdp_ratio,        w = nom_gdp, na.rm = TRUE),
+    pb_gdp    = weighted.mean(primary_bal_gdp_ratio, w = nom_gdp, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+p_cp_infl <- ggplot(cp_agg, aes(x = quarter, y = core_infl,
+                                  color = group, linetype = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "black",
+             linewidth = 0.5) +
+  scale_color_manual(values = c(Core = "steelblue", Periphery = "tomato")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title = "Core Inflation: Core vs Periphery",
+       x = NULL, y = "y/y %", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+p_cp_debt <- ggplot(cp_agg, aes(x = quarter, y = debt_gdp,
+                                  color = group, linetype = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 60, linetype = "dashed", color = "grey50",
+             linewidth = 0.5) +
+  scale_color_manual(values = c(Core = "steelblue", Periphery = "tomato")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title = "Debt / GDP: Core vs Periphery",
+       x = NULL, y = "% of GDP", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+p_cp_pb <- ggplot(cp_agg, aes(x = quarter, y = pb_gdp,
+                                color = group, linetype = group)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50",
+             linewidth = 0.5) +
+  scale_color_manual(values = c(Core = "steelblue", Periphery = "tomato")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title = "Primary Balance / GDP: Core vs Periphery",
+       x = NULL, y = "% of GDP", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 11) + theme(legend.position = "bottom")
+
+p_cp_panel <- (p_cp_infl | p_cp_debt | p_cp_pb) +
+  plot_annotation(
+    title   = "Core vs Periphery: Key Fiscal and Inflation Variables",
+    caption = paste0("Core: DE, FR, NL, FI, AT, LU  |  ",
+                     "Periphery: IT, ES, PT, EL, IE, BE  |  ",
+                     "GDP-weighted averages within each group."),
+    theme   = theme(plot.title = element_text(face = "bold"))
+  )
+print(p_cp_panel)
+ggsave("figures/context/figC11_core_periphery.jpg", p_cp_panel, width = 14, height = 5)
+
+# ── TABLE C1: Cross-country summary statistics (improved) ─────────────────────
+# Ordered by mean primary balance (ascending: most negative first).
+# Negative PB countries highlighted in red via kableExtra.
+# SD of inflation removed (not informative for the reader's context).
+tab_ctry <- df_panel %>%
+  filter(quarter >= PLOT_START) %>%
+  group_by(geo, group) %>%
+  summarise(
+    `Mean core infl (%)`  = round(mean(infl_core,             na.rm = TRUE), 2),
+    `Mean debt/GDP (%)`   = round(mean(debt_gdp_ratio,        na.rm = TRUE), 1),
+    `Mean PB/GDP (%)`     = round(mean(primary_bal_gdp_ratio, na.rm = TRUE), 2),
+    `Mean unemp (%)`      = round(mean(unemp_rate,            na.rm = TRUE), 2),
+    .groups               = "drop"
+  ) %>%
+  arrange(`Mean PB/GDP (%)`) %>%   # ascending: most negative first
+  rename(Country = geo, Group = group)
+
+cat("\n--- Table C1: Cross-Country Summary Statistics (2016Q1–2026Q1) ---\n")
+print(tab_ctry)
+
+# Formatted HTML/LaTeX table with red highlighting for negative PB
+tab_ctry %>%
+  kbl(caption = "Cross-Country Summary Statistics, 2016Q1–2026Q1",
+      align   = c("l","l","r","r","r","r"),
+      booktabs = TRUE) %>%
+  kable_styling(full_width = FALSE, latex_options = c("hold_position")) %>%
+  row_spec(which(tab_ctry$`Mean PB/GDP (%)` < 0),
+           color = "white", background = "#c0392b") %>%
+  footnote(general = paste0(
+    "Sample: 2016Q1-2026Q1. GDP-weighted within-country averages. ",
+    "Red rows = negative mean primary balance over the sample period.")) %>%
+  print()
+
+# ── FIGURE C12: Scatter — average debt vs average core inflation ───────────────
+tab_scatter <- df_panel %>%
+  filter(quarter >= PLOT_START) %>%
+  group_by(geo, country, group) %>%
+  summarise(
+    mean_debt = mean(debt_gdp_ratio,        na.rm = TRUE),
+    mean_infl = mean(infl_core,             na.rm = TRUE),
+    mean_pb   = mean(primary_bal_gdp_ratio, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+p_scatter <- ggplot(tab_scatter,
+    aes(x = mean_debt, y = mean_infl,
+        label = geo, color = group, shape = group)) +
+  geom_point(aes(size = abs(mean_pb)), alpha = 0.85) +
+  geom_text_repel(size = 3.2, box.padding = 0.4, show.legend = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE,
+              color = "grey30", linewidth = 0.7, linetype = "dashed") +
+  scale_color_manual(values = c(Core = "steelblue", Periphery = "tomato")) +
+  scale_shape_manual(values = c(Core = 16, Periphery = 17)) +
+  scale_size_continuous(range = c(3, 8), guide = "none") +
+  labs(title    = "Average Debt/GDP vs Average Core Inflation by Country",
+       subtitle = "Sample: 2016Q1–2026Q1. Point size ∝ |mean primary balance|.",
+       x = "Mean Debt / GDP (%)", y = "Mean Core Inflation (%)",
+       color = NULL, shape = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+print(p_scatter)
+ggsave("figures/context/figC12_scatter_debt_infl.jpg", p_scatter, width = 9, height = 6)
+
+cat("  Context figures saved: figC1–figC12\n")
+cat("  Table C1 printed to console and HTML/PDF output\n")
+```
+
+
+# 2. SHOCK IDENTIFICATION 
+```{r section2_shock}
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. SHOCK IDENTIFICATION  (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (!dir.exists("figures/shock")) {
+  dir.create("figures/shock")
+}
+
+cat("\n[2] Identifying fiscal innovations...\n")
+
+df_panel <- df_panel %>%
+  arrange(geo, quarter) %>%
+  mutate(.row_id = row_number())
+
+df_clean_main <- df_panel %>%
+  filter(
+    !is.na(d_pb_gdp), !is.na(unemp_rate_lag), !is.na(gdp_growth_rate_lag),
+    !is.na(infl_core_lag1), !is.na(primary_bal_gdp_ratio_lag),
+    !is.na(debt_gdp_ratio_lag1), !is.na(d_pb_gdp_lag1), !is.na(d_pb_gdp_lag2)
+  ) %>%
+  group_by(quarter) %>% filter(n() > 1) %>% ungroup() %>%
+  group_by(geo)     %>% filter(n() > 1) %>% ungroup()
+
+twfe_main <- feols(
+  d_pb_gdp ~ unemp_rate_lag + gdp_growth_rate_lag + infl_core_lag1 +
+    primary_bal_gdp_ratio_lag + debt_gdp_ratio_lag1 +
+    d_pb_gdp_lag1 + d_pb_gdp_lag2 | geo + quarter,
+  data = df_clean_main, cluster = ~geo
+)
+
+cat("\n--- TWFE First Stage (AR-augmented) ---\n")
+print(summary(twfe_main))
+
+removed  <- twfe_main$obs_selection$obsRemoved
+if (is.null(removed)) removed <- integer(0)
+kept_pos <- setdiff(seq_len(nrow(df_clean_main)), removed)
+row_ids  <- df_clean_main$.row_id[kept_pos]
+
+if (length(row_ids) != twfe_main$nobs)
+  stop(sprintf("Residual alignment failed: %d row_ids vs %d nobs.",
+               length(row_ids), twfe_main$nobs))
+
+df_panel$u_hat <- NA_real_
+df_panel$u_hat[row_ids] <- twfe_main$residuals
+
+cat("  Residuals assigned:", sum(!is.na(df_panel$u_hat)),
+    "| feols nobs:", twfe_main$nobs,
+    "| Match:", sum(!is.na(df_panel$u_hat)) == twfe_main$nobs, "\n")
+
+overall_cor <- cor(df_panel$d_pb_gdp, df_panel$u_hat,
+                   use = "pairwise.complete.obs")
+cat("  Panel-wide corr(d_pb_gdp, u_hat):", round(overall_cor, 4), "\n")
+
+cond1 <- feols(
+  u_hat ~ unemp_rate_lag + gdp_growth_rate_lag + infl_core_lag1 +
+    primary_bal_gdp_ratio_lag + debt_gdp_ratio_lag1 | geo + quarter,
+  data = df_panel, cluster = ~geo
+)
+print(summary(cond1))
+cat("\nWald test (joint nullity):\n")
+print(wald(cond1, keep = c("unemp_rate_lag","gdp_growth_rate_lag",
+                            "infl_core_lag1","primary_bal_gdp_ratio_lag",
+                            "debt_gdp_ratio_lag1")))
+
+cyc_vars      <- c("unemp_rate_lag","gdp_growth_rate_lag","infl_core_lag1")
+purified_cors <- cor(df_panel[,c("u_hat", cyc_vars)], use = "pairwise.complete.obs")
+cat("\nPurified u_hat correlations:\n")
+print(round(purified_cors["u_hat", cyc_vars], 4))
+
+baseline_cor_check <- overall_cor
+
+cor_by_country <- df_panel %>%
+  filter(!is.na(u_hat), !is.na(d_pb_gdp)) %>%
+  group_by(geo) %>%
+  summarise(correlation = cor(d_pb_gdp, u_hat, use = "pairwise.complete.obs"),
+            .groups = "drop") %>%
+  arrange(desc(correlation))
+
+p_cor <- ggplot(cor_by_country,
+                aes(x = reorder(geo, correlation), y = correlation,
+                    fill = correlation)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = overall_cor, linetype = "dashed", color = "red") +
+  annotate("text", x = 2, y = overall_cor + 0.025,
+           label = paste0("Panel avg: ", round(overall_cor, 2)),
+           color = "red", size = 3.5, hjust = 0) +
+  scale_fill_gradient2(low = "steelblue", mid = "grey85",
+                       high = "tomato", midpoint = 0.5) +
+  coord_flip() +
+  labs(title    = "Correlation: Delta(PB/GDP) and Fiscal Shock by Country",
+       subtitle = "Dashed = panel-wide correlation",
+       x = NULL, y = "Correlation") +
+  theme_minimal(base_size = 13)
+print(p_cor)
+ggsave("figures/shock/fig1_country_correlations.jpg", p_cor, width = 8, height = 5)
+```
+
+# 2b. DEBT-WEIGHTED AGGREGATE SHOCK
+
+```{r section2b_debt_weighting}
+# ══════════════════════════════════════════════════════════════════════════════
+# 2b. DEBT-WEIGHTED AGGREGATE SHOCK
+# ══════════════════════════════════════════════════════════════════════════════
+# Motivation: GDP weighting gives the most weight to Germany (~30% of EA GDP),
+# which historically has low debt and relatively anchored fiscal policy.
+# Debt weighting shifts weight toward Italy, Greece, Portugal, Belgium — the
+# countries where fiscal dominance is most plausible. If the two aggregations
+# give different results, it tells us something about which part of the EA
+# is driving the (non-)response of expectations.
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("\n[2b] Computing debt-weighted EA aggregate shock...\n")
+
+# Compute debt weights: each country's share of total EA debt in each quarter
+df_panel <- df_panel %>%
+  group_by(quarter) %>%
+  mutate(
+    ea_total_debt  = sum(debt,    na.rm = TRUE),
+    debt_weight    = debt / ea_total_debt          # debt share weight
+  ) %>%
+  ungroup()
+
+# GDP-weighted aggregate (existing, for direct comparison)
+u_hat_gdp_wt <- df_panel %>%
+  filter(!is.na(u_hat), !is.na(nom_gdp)) %>%
+  mutate(year        = as.integer(format(as.Date(quarter), "%Y")),
+         quarter_num = as.integer(gsub(".*Q", "", as.character(quarter)))) %>%
+  group_by(year, quarter_num) %>%
+  summarise(u_hat_ea_gdp  = weighted.mean(u_hat, w = nom_gdp,     na.rm = TRUE),
+            .groups = "drop")
+
+# Debt-weighted aggregate (new)
+u_hat_debt_wt <- df_panel %>%
+  filter(!is.na(u_hat), !is.na(debt_weight)) %>%
+  mutate(year        = as.integer(format(as.Date(quarter), "%Y")),
+         quarter_num = as.integer(gsub(".*Q", "", as.character(quarter)))) %>%
+  group_by(year, quarter_num) %>%
+  summarise(u_hat_ea_debt = weighted.mean(u_hat, w = debt_weight, na.rm = TRUE),
+            .groups = "drop")
+
+# Merge both weights into one comparison tibble
+u_hat_compare <- u_hat_gdp_wt %>%
+  left_join(u_hat_debt_wt, by = c("year","quarter_num")) %>%
+  mutate(quarter = as.yearqtr(paste0(year, " Q", quarter_num)))
+
+cat(sprintf("  GDP-weighted shock  — mean: %.4f  SD: %.4f\n",
+            mean(u_hat_compare$u_hat_ea_gdp,  na.rm = TRUE),
+            sd(u_hat_compare$u_hat_ea_gdp,   na.rm = TRUE)))
+cat(sprintf("  Debt-weighted shock — mean: %.4f  SD: %.4f\n",
+            mean(u_hat_compare$u_hat_ea_debt, na.rm = TRUE),
+            sd(u_hat_compare$u_hat_ea_debt,  na.rm = TRUE)))
+cat(sprintf("  Corr(GDP-wt, Debt-wt): %.4f\n",
+            cor(u_hat_compare$u_hat_ea_gdp,
+                u_hat_compare$u_hat_ea_debt, use = "pairwise.complete.obs")))
+
+# Figure: time series of both shock series
+p_shocks_compare <- u_hat_compare %>%
+  pivot_longer(cols = c(u_hat_ea_gdp, u_hat_ea_debt),
+               names_to = "weighting", values_to = "shock") %>%
+  mutate(weighting = recode(weighting,
+    u_hat_ea_gdp  = "GDP-weighted",
+    u_hat_ea_debt = "Debt-weighted")) %>%
+  ggplot(aes(x = quarter, y = shock, color = weighting, linetype = weighting)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 0.9) +
+  scale_color_manual(values = c("steelblue","tomato")) +
+  scale_linetype_manual(values = c("solid","dashed")) +
+  scale_x_yearqtr(format = "%Y", n = 8) +
+  labs(title    = "EA Fiscal Shock: GDP-Weighted vs Debt-Weighted",
+       subtitle = "TWFE residual aggregated using GDP and debt shares",
+       x = NULL, y = "Fiscal shock (pp)", color = NULL, linetype = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+print(p_shocks_compare)
+ggsave("figures/shock/fig_shock_gdp_vs_debt.jpg", p_shocks_compare, width = 10, height = 5)
+
+# Attach both to spf_merged after SPF section runs
+# (we store u_hat_compare now; we merge in section 5)
+```
+
+# 3. BASELINE LOCAL PROJECTIONS  
+```{r section3_baseline_lp}
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. BASELINE LOCAL PROJECTIONS  (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (!dir.exists("figures/lp")) {
+  dir.create("figures/lp")
+}
+
+cat("\n[3] Running baseline local projections...\n")
+
+df_lp <- df_panel %>% arrange(geo, quarter)
+for (h in 0:H_QUARTERLY) {
+  df_lp <- df_lp %>%
+    group_by(geo) %>%
+    mutate("infl_core_h{h}" := lead(infl_core, h)) %>%
+    ungroup()
+}
+
+lp_controls <- c("debt_gdp_ratio_lag1", "gdp_growth_rate_lag",
+                  "unemp_rate_lag", "primary_bal_gdp_ratio_lag",
+                  "infl_core_lag1")
+
+run_lp <- function(data, shock_var, controls, H,
+                   fe = "geo + quarter", cluster = "~geo") {
+  lapply(0:H, function(h) {
+    dep_var <- paste0("infl_core_h", h)
+    if (!dep_var %in% names(data)) return(NULL)
+    fml  <- as.formula(paste(dep_var, "~", shock_var, "+",
+                              paste(controls, collapse = " + "), "|", fe))
+    fit  <- feols(fml, data = data, cluster = as.formula(cluster))
+    coef_h <- coef(fit)[shock_var]; se_h <- se(fit)[shock_var]
+    tibble(horizon  = h,
+           estimate = coef_h, se = se_h,
+           ci_low   = coef_h - CI_Z * se_h,
+           ci_high  = coef_h + CI_Z * se_h,
+           p_val    = 2 * pt(abs(coef_h / se_h),
+                             df = fit$nobs - fit$nparams,
+                             lower.tail = FALSE),
+           n_obs    = fit$nobs)
+  }) %>% bind_rows()
+}
+
+irf_baseline <- run_lp(df_lp, "u_hat", lp_controls, H_QUARTERLY) %>%
+  mutate(sig = case_when(p_val < 0.01 ~ "**", p_val < 0.05 ~ "*", TRUE ~ ""))
+
+cat("\n--- Baseline LP IRF ---\n")
+print(irf_baseline)
+
+p_irf <- ggplot(irf_baseline, aes(x = horizon, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.2, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  scale_x_continuous(breaks = 0:H_QUARTERLY) +
+  labs(title    = "LP: Response of Core Inflation to Fiscal Innovation",
+       subtitle = paste0("AR(2)-augmented first stage | Corr(u, DeltaPB/GDP) = ",
+                         round(overall_cor, 3), " | ", CI_LABEL),
+       x = "Horizon (quarters)", y = "Response of core inflation (pp)") +
+  theme_minimal(base_size = 13)
+print(p_irf)
+ggsave("figures/lp/fig2_baseline_irf.jpg", p_irf, width = 9, height = 5)
+```
+
+
+
+
+## dowload SPF dai CSV local
+
+csv_files <- list.files(INPUT_FOLDER, pattern = "^\\d{4}Q\\d\\.csv$", full.names = TRUE)
+
+length(csv_files)
+head(csv_files)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 4. SPF DATA CONSOLIDATION AND MERGE  
+```{r section4_spf}
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. SPF DATA CONSOLIDATION AND MERGE  (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n[4] Processing SPF microdata...\n")
+
+parse_survey_round <- function(filename) {
+  stem  <- tools::file_path_sans_ext(basename(filename))
+  match <- regmatches(stem, regexpr("^(\\d{4})Q(\\d)$", stem, perl = TRUE))
+  if (length(match) == 0) return(list(year = NA, quarter = NA, round = stem))
+  list(year    = as.integer(substr(match, 1, 4)),
+       quarter = as.integer(substr(match, 6, 6)),
+       round   = match)
+}
+
+read_core_section <- function(filepath) {
+  lines            <- readLines(filepath, warn = FALSE)
+  CORE_HEADER      <- "CORE INFLATION EXPECTATIONS"
+  section_keywords <- c("INFLATION EXPECTATIONS","GROWTH EXPECTATIONS",
+                         "EXPECTED UNEMPLOYMENT","ASSUMPTIONS")
+  section_start <- which(str_detect(lines, fixed(CORE_HEADER)))
+  if (length(section_start) == 0) return(NULL)
+  section_start <- section_start[1]
+  col_header_idx <- NULL
+  for (i in (section_start + 1):min(section_start + 5, length(lines))) {
+    if (str_detect(lines[i], "TARGET_PERIOD")) { col_header_idx <- i; break }
+    if (any(str_starts(str_trim(lines[i]), section_keywords))) {
+      message("  INFO: Core section empty in ", basename(filepath), " — skipping")
+      return(NULL)
+    }
+  }
+  if (is.null(col_header_idx)) return(NULL)
+  col_names <- str_split(lines[col_header_idx], ",")[[1]] %>%
+    str_trim() %>% str_replace_all("\\s+", "_")
+  col_names <- col_names[col_names != ""]
+  data_start <- col_header_idx + 1; data_end <- length(lines)
+  for (i in data_start:length(lines)) {
+    line <- str_trim(lines[i])
+    if (any(str_starts(line, section_keywords))) { data_end <- i - 1; break }
+    if (line == "" && i + 1 <= length(lines) &&
+        str_trim(lines[i + 1]) == "") { data_end <- i - 1; break }
+  }
+  if (data_start > data_end) return(NULL)
+  data_lines <- lines[data_start:data_end]
+  data_lines <- data_lines[str_trim(data_lines) != ""]
+  if (length(data_lines) == 0) return(NULL)
+  rows <- str_split(data_lines, ",") %>%
+    map(function(x) { x <- str_trim(x); length(x) <- length(col_names); x })
+  df <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+  colnames(df) <- col_names
+  df
+}
+
+classify_horizon <- function(tp, survey_year) {
+  tp_year <- suppressWarnings(as.integer(substr(as.character(tp), 1, 4)))
+  gap     <- tp_year - survey_year
+  case_when(gap <= 0 ~ "current_yr", gap == 1 ~ "1yr_ahead",
+            gap == 2 ~ "2yr_ahead",  gap >= 3 ~ "5yr_ahead", TRUE ~ "other")
+}
+
+process_spf_file <- function(filepath) {
+  meta <- parse_survey_round(basename(filepath))
+  if (is.na(meta$year)) return(NULL)
+  message("  Processing ", basename(filepath))
+  df <- read_core_section(filepath)
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  df %>%
+    rename(target_period = TARGET_PERIOD, forecaster_id = FCT_SOURCE,
+           point_forecast = POINT) %>%
+    mutate(point_forecast = suppressWarnings(as.numeric(point_forecast)),
+           forecaster_id  = suppressWarnings(as.numeric(forecaster_id))) %>%
+    filter(!is.na(forecaster_id), !is.na(point_forecast)) %>%
+    mutate(survey_round   = meta$round, survey_year = meta$year,
+           survey_quarter = meta$quarter,
+           horizon_type   = classify_horizon(target_period, meta$year)) %>%
+    filter(horizon_type != "other") %>%
+    select(survey_round, survey_year, survey_quarter,
+           forecaster_id, target_period, horizon_type, point_forecast)
+}
+
+csv_files <- list.files(INPUT_FOLDER, pattern = "^\\d{4}Q\\d\\.csv$",
+                         full.names = TRUE) %>% sort()
+
+if (length(csv_files) == 0) {
+  warning("No SPF CSV files found. Skipping Sections 5 and 6.")
+} else {
+  cat("  Found", length(csv_files), "SPF files\n")
+  spf_long <- map(csv_files, process_spf_file) %>% compact() %>% bind_rows()
+
+  spf_wide <- spf_long %>%
+    group_by(survey_round, survey_year, survey_quarter,
+             forecaster_id, horizon_type) %>%
+    summarise(point_forecast = mean(point_forecast, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = horizon_type, values_from = point_forecast,
+                names_prefix = "forecast_") %>%
+    rename_with(~ str_replace(., "forecast_current_yr", "forecast_cy"),
+                starts_with("forecast_current")) %>%
+    rename_with(~ str_replace(., "forecast_(.*)_ahead", "forecast_\\1"),
+                contains("ahead")) %>%
+    arrange(forecaster_id, survey_year, survey_quarter) %>%
+    group_by(forecaster_id) %>%
+    mutate(rev_1yr = forecast_1yr - lag(forecast_1yr),
+           rev_2yr = forecast_2yr - lag(forecast_2yr),
+           rev_5yr = forecast_5yr - lag(forecast_5yr)) %>%
+    ungroup()
+
+  cat("\n  SPF panel summary:\n")
+  cat("  Rounds:      ", n_distinct(spf_wide$survey_round),  "\n")
+  cat("  Forecasters: ", n_distinct(spf_wide$forecaster_id), "\n")
+  cat("  Observations:", nrow(spf_wide), "\n")
+  for (col in c("forecast_cy","forecast_1yr","forecast_2yr","forecast_5yr")) {
+    if (col %in% names(spf_wide))
+      cat(sprintf("  Coverage %-18s: %.1f%%\n", col,
+                  mean(!is.na(spf_wide[[col]])) * 100))
+  }
+
+  core_actual <- tryCatch({
+    library(ecb)
+    get_data("ICP.M.U2.N.XEF000.4.ANR") %>%
+      mutate(date        = as.Date(paste0(substr(obstime, 1, 7), "-01")),
+             quarter_num = ceiling(as.integer(format(date, "%m")) / 3),
+             year        = as.integer(format(date, "%Y"))) %>%
+      group_by(year, quarter_num) %>%
+      summarise(core_actual = mean(obsvalue, na.rm = TRUE), .groups = "drop")
+  }, error = function(e) {
+    warning("ECB data fetch failed: ", e$message)
+    tibble(year = integer(), quarter_num = integer(), core_actual = numeric())
+  })
+
+  spf_wide <- spf_wide %>%
+    left_join(core_actual, by = c("survey_year" = "year",
+                                   "survey_quarter" = "quarter_num")) %>%
+    arrange(forecaster_id, survey_year, survey_quarter) %>%
+    group_by(forecaster_id) %>%
+    mutate(fe_1yr   = core_actual - lag(forecast_1yr, 4),
+           delta_lr = forecast_5yr - lag(forecast_5yr, 1)) %>%
+    ungroup() %>%
+    mutate(
+      period    = ifelse(survey_year < 2020, "pre2020", "post2020"),
+      subperiod = assign_subperiod(survey_year, survey_quarter),
+      subperiod = factor(subperiod, levels = c("Pre-pandemic","COVID",
+                                               "Ukraine/peak","Post-tightening"))
+    )
+
+  # ── GDP-weighted EA shock (original) ────────────────────────────────────
+  u_hat_ea <- df_panel %>%
+    filter(!is.na(u_hat)) %>%
+    mutate(year        = as.integer(format(as.Date(quarter), "%Y")),
+           quarter_num = as.integer(gsub(".*Q", "", as.character(quarter)))) %>%
+    group_by(year, quarter_num) %>%
+    summarise(u_hat_ea = weighted.mean(u_hat, w = nom_gdp, na.rm = TRUE),
+              .groups  = "drop")
+
+  # ── Debt-weighted EA shock (new) ────────────────────────────────────────
+  u_hat_ea_debt <- df_panel %>%
+    filter(!is.na(u_hat), !is.na(debt_weight)) %>%
+    mutate(year        = as.integer(format(as.Date(quarter), "%Y")),
+           quarter_num = as.integer(gsub(".*Q", "", as.character(quarter)))) %>%
+    group_by(year, quarter_num) %>%
+    summarise(u_hat_ea_debt = weighted.mean(u_hat, w = debt_weight, na.rm = TRUE),
+              .groups       = "drop")
+
+  spf_merged <- spf_wide %>%
+    left_join(u_hat_ea,      by = c("survey_year" = "year",
+                                     "survey_quarter" = "quarter_num")) %>%
+    left_join(u_hat_ea_debt, by = c("survey_year" = "year",
+                                     "survey_quarter" = "quarter_num"))
+
+  cat("  SPF rounds with GDP-weighted shock:  ",
+      sum(!is.na(spf_merged$u_hat_ea)), "\n")
+  cat("  SPF rounds with debt-weighted shock: ",
+      sum(!is.na(spf_merged$u_hat_ea_debt)), "\n")
+}
+```
+
+# 5. EXPECTATIONS HORIZON LP — FULL SAMPLE + SUB-PERIODS + DEBT WEIGHT
+
+```{r section5_spf_lp}
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. EXPECTATIONS HORIZON LP — FULL SAMPLE + SUB-PERIODS + DEBT WEIGHT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (exists("spf_merged")) {
+  cat("\n[5] Expectations horizon LP...\n")
+
+  # ── 5a. Build round-level aggregated time series ─────────────────────────
+  # (same structure as original — just adds debt-weighted shock column)
+  spf_ts <- spf_merged %>%
+    group_by(survey_round, survey_year, survey_quarter,
+             u_hat_ea, u_hat_ea_debt, subperiod) %>%
+    summarise(rev_1yr       = mean(rev_1yr, na.rm = TRUE),
+              rev_2yr       = mean(rev_2yr, na.rm = TRUE),
+              rev_5yr       = mean(rev_5yr, na.rm = TRUE),
+              n_forecasters = n(),
+              .groups       = "drop") %>%
+    arrange(survey_year, survey_quarter)
+
+  for (h in 0:H_SPF) {
+    spf_ts <- spf_ts %>%
+      mutate("rev_1yr_h{h}" := lead(rev_1yr, h),
+             "rev_2yr_h{h}" := lead(rev_2yr, h),
+             "rev_5yr_h{h}" := lead(rev_5yr, h))
+  }
+
+  # ── run_spf_lp: flexible shock variable (same signature as original) ──────
+  run_spf_lp <- function(outcome_stem, data, shock_col = "u_hat_ea",
+                         H = H_SPF) {
+    lapply(0:H, function(h) {
+      dep_var <- paste0(outcome_stem, "_h", h)
+      if (!dep_var %in% names(data) || sum(!is.na(data[[dep_var]])) < 10)
+        return(NULL)
+      lag_var <- paste0(outcome_stem, "_lag1")
+      data[[lag_var]] <- lag(data[[outcome_stem]], 1)
+      fml <- as.formula(paste(dep_var, "~", shock_col, "+", lag_var))
+      fit <- lm(fml, data = data)
+      nw_se <- tryCatch(
+        sqrt(diag(NeweyWest(fit, lag = 4, prewhite = FALSE)))[[shock_col]],
+        error = function(e)
+          summary(fit)$coefficients[shock_col, "Std. Error"]
+      )
+      coef_h <- coef(fit)[shock_col]
+      tibble(horizon  = h, outcome = outcome_stem,
+             estimate = coef_h, se = nw_se,
+             ci_low   = coef_h - CI_Z * nw_se,
+             ci_high  = coef_h + CI_Z * nw_se,
+             p_val    = 2 * pt(abs(coef_h / nw_se),
+                               df = fit$df.residual, lower.tail = FALSE))
+    }) %>% bind_rows()
+  }
+
+  # ── 5b. Full-sample LP — GDP-weighted (original) ─────────────────────────
+  irf_spf <- bind_rows(
+    run_spf_lp("rev_1yr", spf_ts, shock_col = "u_hat_ea"),
+    run_spf_lp("rev_2yr", spf_ts, shock_col = "u_hat_ea"),
+    run_spf_lp("rev_5yr", spf_ts, shock_col = "u_hat_ea")
+  ) %>%
+    mutate(horizon_label = case_when(
+      outcome == "rev_1yr" ~ "1-year ahead",
+      outcome == "rev_2yr" ~ "2-year ahead",
+      outcome == "rev_5yr" ~ "5-year ahead (long-run)"
+    ))
+
+  cat("\n--- Full-sample LP (GDP-weighted shock) ---\n")
+  print(irf_spf %>% select(horizon, horizon_label, estimate, se, p_val))
+
+  p_spf <- ggplot(irf_spf,
+                  aes(x = horizon, y = estimate,
+                      color = horizon_label, fill = horizon_label)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+    geom_line(linewidth = 1) + geom_point(size = 2) +
+    facet_wrap(~horizon_label, ncol = 3) +
+    scale_color_manual(values = c("steelblue","darkgreen","tomato")) +
+    scale_fill_manual(values  = c("steelblue","darkgreen","tomato")) +
+    scale_x_continuous(breaks = 0:H_SPF) +
+    labs(title    = "LP: SPF Core Inflation Revisions — Full Sample (GDP-Weighted Shock)",
+         subtitle = paste0("Newey-West SE | ", CI_LABEL),
+         x = "Horizon (quarters)", y = "Revision in forecast (pp)",
+         color = NULL, fill = NULL) +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+  print(p_spf)
+  ggsave("figures/lp/fig3_spf_horizon_lp.jpg", p_spf, width = 12, height = 4)
+
+  # ── 5c. Full-sample LP — debt-weighted (new) ─────────────────────────────
+  irf_spf_debt <- bind_rows(
+    run_spf_lp("rev_1yr", spf_ts, shock_col = "u_hat_ea_debt"),
+    run_spf_lp("rev_2yr", spf_ts, shock_col = "u_hat_ea_debt"),
+    run_spf_lp("rev_5yr", spf_ts, shock_col = "u_hat_ea_debt")
+  ) %>%
+    mutate(horizon_label = case_when(
+      outcome == "rev_1yr" ~ "1-year ahead",
+      outcome == "rev_2yr" ~ "2-year ahead",
+      outcome == "rev_5yr" ~ "5-year ahead (long-run)"
+    ))
+
+  cat("\n--- Full-sample LP (debt-weighted shock) ---\n")
+  print(irf_spf_debt %>% select(horizon, horizon_label, estimate, se, p_val))
+
+  p_spf_debt <- ggplot(irf_spf_debt,
+                  aes(x = horizon, y = estimate,
+                      color = horizon_label, fill = horizon_label)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+    geom_line(linewidth = 1) + geom_point(size = 2) +
+    facet_wrap(~horizon_label, ncol = 3) +
+    scale_color_manual(values = c("steelblue","darkgreen","tomato")) +
+    scale_fill_manual(values  = c("steelblue","darkgreen","tomato")) +
+    scale_x_continuous(breaks = 0:H_SPF) +
+    labs(title    = "LP: SPF Core Inflation Revisions — Full Sample (Debt-Weighted Shock)",
+         subtitle = paste0("Newey-West SE | ", CI_LABEL),
+         x = "Horizon (quarters)", y = "Revision in forecast (pp)",
+         color = NULL, fill = NULL) +
+    theme_minimal(base_size = 12) + theme(legend.position = "none")
+  print(p_spf_debt)
+  ggsave("figures/lp/fig3b_spf_horizon_lp_debt.jpg", p_spf_debt, width = 12, height = 4)
+
+  # ── 5d. GDP vs Debt — overlay comparison for 5yr horizon only ─────────────
+  compare_5yr <- bind_rows(
+    irf_spf      %>% filter(outcome == "rev_5yr") %>%
+      mutate(weighting = "GDP-weighted"),
+    irf_spf_debt %>% filter(outcome == "rev_5yr") %>%
+      mutate(weighting = "Debt-weighted")
+  )
+
+  p_compare_wt <- ggplot(compare_5yr,
+      aes(x = horizon, y = estimate,
+          color = weighting, fill = weighting)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+    geom_line(linewidth = 1) + geom_point(size = 2) +
+    scale_x_continuous(breaks = 0:H_SPF) +
+    scale_color_manual(values = c("steelblue","tomato")) +
+    scale_fill_manual(values  = c("steelblue","tomato")) +
+    labs(title    = "5yr SPF Revision: GDP-Weighted vs Debt-Weighted Shock",
+         subtitle = paste0("Newey-West SE | ", CI_LABEL),
+         x = "Horizon (quarters)", y = "Revision in 5yr forecast (pp)",
+         color = NULL, fill = NULL) +
+    theme_minimal(base_size = 12) + theme(legend.position = "bottom")
+  print(p_compare_wt)
+  ggsave("figures/lp/fig_compare_weights_5yr.jpg", p_compare_wt, width = 9, height = 5)
+
+  # ── 5e. SUB-PERIOD LP — 5yr horizon only, GDP-weighted ───────────────────
+  run_spf_lp_subperiod <- function(sp_label, data, shock_col = "u_hat_ea",
+                                    outcome_stem = "rev_5yr", H = H_SPF) {
+    d <- data %>% filter(subperiod == sp_label)
+    if (nrow(d) < 8) {
+      message("  Skipping sub-period (too few obs): ", sp_label)
+      return(NULL)
+    }
+    lapply(0:H, function(h) {
+      dep_var <- paste0(outcome_stem, "_h", h)
+      if (!dep_var %in% names(d) || sum(!is.na(d[[dep_var]])) < 6)
+        return(NULL)
+      lag_var <- paste0(outcome_stem, "_lag1")
+      d[[lag_var]] <- lag(d[[outcome_stem]], 1)
+      fml <- as.formula(paste(dep_var, "~", shock_col, "+", lag_var))
+      fit <- lm(fml, data = d)
+      nw_lag <- max(2, floor(nrow(d) / 4))
+      nw_se  <- tryCatch(
+        sqrt(diag(NeweyWest(fit, lag = nw_lag, prewhite = FALSE)))[[shock_col]],
+        error = function(e) summary(fit)$coefficients[shock_col, "Std. Error"]
+      )
+      coef_h <- coef(fit)[shock_col]
+      tibble(horizon   = h, subperiod = sp_label,
+             estimate  = coef_h, se = nw_se,
+             ci_low    = coef_h - CI_Z * nw_se,
+             ci_high   = coef_h + CI_Z * nw_se,
+             p_val     = 2 * pt(abs(coef_h / nw_se),
+                                 df = fit$df.residual, lower.tail = FALSE),
+             n_rounds  = nrow(d))
+    }) %>% bind_rows()
+  }
+
+  sp_levels <- c("Pre-pandemic","COVID","Ukraine/peak","Post-tightening")
+
+  irf_subperiods <- bind_rows(lapply(sp_levels, run_spf_lp_subperiod,
+                                     data = spf_ts, shock_col = "u_hat_ea"))
+
+  cat("\n--- Sub-period LP (5yr revision, GDP-weighted) ---\n")
+  print(irf_subperiods %>% select(horizon, subperiod, estimate, se, p_val))
+
+  p_subperiods <- ggplot(irf_subperiods,
+      aes(x = horizon, y = estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = ci_low, ymax = ci_high),
+                alpha = 0.2, fill = "steelblue") +
+    geom_line(color = "steelblue", linewidth = 0.9) +
+    geom_point(color = "steelblue", size = 1.8) +
+    facet_wrap(~subperiod, ncol = 2, scales = "free_y") +
+    scale_x_continuous(breaks = 0:H_SPF) +
+    labs(title    = "LP: 5yr SPF Revision by Sub-Period (GDP-Weighted Shock)",
+         subtitle = paste0("Newey-West SE | ", CI_LABEL),
+         x = "Horizon (quarters)", y = "Revision in 5yr forecast (pp)") +
+    theme_minimal(base_size = 11)
+  print(p_subperiods)
+  ggsave("figures/lp/fig_subperiods_5yr.jpg", p_subperiods, width = 10, height = 6)
+
+  # ── 5f. SUB-PERIOD LP — debt-weighted shock ───────────────────────────────
+  irf_subperiods_debt <- bind_rows(lapply(sp_levels, run_spf_lp_subperiod,
+                                          data = spf_ts,
+                                          shock_col = "u_hat_ea_debt"))
+
+  p_subperiods_debt <- ggplot(irf_subperiods_debt,
+      aes(x = horizon, y = estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = ci_low, ymax = ci_high),
+                alpha = 0.2, fill = "tomato") +
+    geom_line(color = "tomato", linewidth = 0.9) +
+    geom_point(color = "tomato", size = 1.8) +
+    facet_wrap(~subperiod, ncol = 2, scales = "free_y") +
+    scale_x_continuous(breaks = 0:H_SPF) +
+    labs(title    = "LP: 5yr SPF Revision by Sub-Period (Debt-Weighted Shock)",
+         subtitle = paste0("Newey-West SE | ", CI_LABEL),
+         x = "Horizon (quarters)", y = "Revision in 5yr forecast (pp)") +
+    theme_minimal(base_size = 11)
+  print(p_subperiods_debt)
+  ggsave("figures/lp/fig_subperiods_5yr_debt.jpg", p_subperiods_debt, width = 10, height = 6)
+
+  # Robustness: no lag control
+  run_spf_lp_noctrl <- function(outcome_stem, data, shock_col = "u_hat_ea",
+                                  H = H_SPF) {
+    lapply(0:H, function(h) {
+      dep_var <- paste0(outcome_stem, "_h", h)
+      if (!dep_var %in% names(data) || sum(!is.na(data[[dep_var]])) < 10)
+        return(NULL)
+      fml    <- as.formula(paste(dep_var, "~", shock_col))
+      fit    <- lm(fml, data = data)
+      nw_se  <- tryCatch(
+        sqrt(diag(NeweyWest(fit, lag = 4, prewhite = FALSE)))[[shock_col]],
+        error = function(e) summary(fit)$coefficients[shock_col, "Std. Error"]
+      )
+      coef_h <- coef(fit)[shock_col]
+      tibble(horizon = h, outcome = outcome_stem,
+             estimate = coef_h, se = nw_se,
+             ci_low   = coef_h - CI_Z * nw_se,
+             ci_high  = coef_h + CI_Z * nw_se,
+             p_val    = 2 * pt(abs(coef_h / nw_se),
+                                df = fit$df.residual, lower.tail = FALSE))
+    }) %>% bind_rows()
+  }
+
+  irf_spf_noctrl <- bind_rows(
+    run_spf_lp_noctrl("rev_1yr", spf_ts),
+    run_spf_lp_noctrl("rev_2yr", spf_ts),
+    run_spf_lp_noctrl("rev_5yr", spf_ts)
+  ) %>%
+    mutate(horizon_label = case_when(
+      outcome == "rev_1yr" ~ "1-year ahead",
+      outcome == "rev_2yr" ~ "2-year ahead",
+      outcome == "rev_5yr" ~ "5-year ahead (long-run)"
+    ))
+  cat("\n--- LP Results (no lag control) ---\n")
+  print(irf_spf_noctrl %>% select(horizon, horizon_label, estimate, se, p_val))
+}
+```
+
+# 6. REIS (2026) TABLE 3 REPLICATION 
+```{r section6_reis_replication}
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. REIS (2026) TABLE 3 REPLICATION  (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (exists("spf_wide")) {
+  cat("\n[6] Reis (2026) Table 3 replication...\n")
+
+  spf_reis <- spf_wide %>% filter(!is.na(delta_lr), !is.na(fe_1yr))
+
+  if (nrow(spf_reis) < 20) {
+    warning("Too few observations.")
+  } else {
+    reis_full <- feols(delta_lr ~ fe_1yr |
+                         forecaster_id + survey_year^survey_quarter,
+                       data = spf_reis, cluster = ~forecaster_id)
+
+    spf_reis_matched <- spf_reis %>%
+      filter(!(survey_year %in% c(2020, 2021)))
+
+    reis_pre_matched  <- feols(delta_lr ~ fe_1yr |
+                                  forecaster_id + survey_year^survey_quarter,
+                               data    = filter(spf_reis_matched,
+                                                survey_year < 2020),
+                               cluster = ~forecaster_id)
+
+    reis_post_matched <- feols(delta_lr ~ fe_1yr |
+                                  forecaster_id + survey_year^survey_quarter,
+                               data    = filter(spf_reis_matched,
+                                                survey_year >= 2022),
+                               cluster = ~forecaster_id)
+
+    cat("\n--- Reis Replication (Reis-matched split, drops 2020-2021) ---\n")
+    modelsummary(
+      list("Full Sample" = reis_full,
+           "Pre-2020"    = reis_pre_matched,
+           "Post-2022"   = reis_post_matched),
+      coef_rename = c("fe_1yr" = "Forecast error (beta)"),
+      gof_map     = c("nobs","r.squared"),
+      stars       = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+      title       = "Sensitivity of Long-Run Core Inflation Expectations (Reis-matched split)"
+    )
+
+    comparison_matched <- tibble(
+      Sample = c("Pre-2020 (EA, ours)", "Post-2022 (EA, ours)",
+                 "Pre-2020 (US, Reis)", "Post-2022 (US, Reis)"),
+      Beta   = c(round(coef(reis_pre_matched)["fe_1yr"],  4),
+                 round(coef(reis_post_matched)["fe_1yr"], 4),
+                 0.0125, 0.0549),
+      SE     = c(round(se(reis_pre_matched)["fe_1yr"],  4),
+                 round(se(reis_post_matched)["fe_1yr"], 4),
+                 0.0016, 0.0055),
+      N      = c(reis_pre_matched$nobs, reis_post_matched$nobs,
+                 11528L, 1314L),
+      Source = c("EA core SPF","EA core SPF",
+                 "Reis US headline","Reis US headline")
+    )
+    cat("\n--- Comparison: EA vs Reis US ---\n")
+    print(comparison_matched)
+    cat("\nNotes:\n")
+    cat("  2020-2021 dropped from both periods.\n")
+    cat("  Our measure: EA core HICP. Reis: US headline CPI.\n")
+  }
+}
+```
+
+# 7. ROBUSTNESS  
+```{r section7_robustness}
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. ROBUSTNESS  (unchanged from original)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (!dir.exists("figures/robustness")) {
+  dir.create("figures/robustness")
+}
+
+cat("\n[7] Robustness checks...\n")
+
+current_cor <- cor(df_panel$d_pb_gdp, df_panel$u_hat,
+                   use = "pairwise.complete.obs")
+cat(sprintf("  u_hat integrity check: corr = %.4f", current_cor))
+if (abs(current_cor - baseline_cor_check) > 0.01) {
+  warning(" u_hat overwritten!")
+} else { cat(" — OK\n") }
+
+fit_and_recover <- function(formula_obj, panel, resid_col) {
+  # 1. Run the model
+  fit <- feols(formula_obj, data = panel, cluster = ~geo)
+  
+  # 2. Get the Dependent Variable (LHS) name
+  lhs_var <- as.character(formula_obj)[2]
+  
+  # 3. Predict fitted values for the ENTIRE panel
+  # predict() in fixest returns NAs for rows that have NAs in RHS variables
+  fitted_values <- predict(fit, newdata = panel)
+  
+  # 4. Residual = Actual - Fitted
+  # This alignment is guaranteed by the 'newdata = panel' argument
+  panel[[resid_col]] <- panel[[lhs_var]] - fitted_values
+  
+  cat(sprintf("Success: %s | Model Nobs: %d | Assigned: %d\n", 
+              resid_col, fit$nobs, sum(!is.na(panel[[resid_col]]))))
+  
+  return(list(panel = panel, fit = fit))
+}
+
+# --- EXECUTE ---
+res_level <- fit_and_recover(fml_level, df_panel, "u_hat_level")
+df_panel  <- res_level$panel
+```
+
+```{r}
+fml_level <- as.formula(
+  "primary_bal_gdp_ratio ~ unemp_rate_lag + gdp_growth_rate_lag +
+   infl_core_lag1 + primary_bal_gdp_ratio_lag + primary_bal_gdp_ratio_lag2 +
+   primary_bal_gdp_ratio_lag3 + debt_gdp_ratio_lag1 | geo + quarter"
+)
+result_level      <- fit_and_recover(fml_level, df_panel, "u_hat_level")
+df_panel          <- result_level$panel
+df_lp$u_hat_level <- df_panel$u_hat_level[
+  match(paste(df_lp$geo, df_lp$quarter),
+        paste(df_panel$geo, df_panel$quarter))]
+irf_level <- run_lp(df_lp, "u_hat_level", lp_controls, H_QUARTERLY)
+
+df_lp <- df_lp %>%
+  group_by(quarter) %>%
+  mutate(gdp_weight = nom_gdp / sum(nom_gdp, na.rm = TRUE)) %>%
+  ungroup()
+
+irf_weighted <- lapply(0:H_QUARTERLY, function(h) {
+  dep_var <- paste0("infl_core_h", h)
+  if (!dep_var %in% names(df_lp)) return(NULL)
+  fml  <- as.formula(paste(dep_var, "~ u_hat +",
+                            paste(lp_controls, collapse = " + "),
+                            "| geo + quarter"))
+  fit  <- feols(fml, data = df_lp, weights = ~gdp_weight, cluster = ~geo)
+  coef_h <- coef(fit)["u_hat"]; se_h <- se(fit)["u_hat"]
+  tibble(horizon = h, estimate = coef_h, se = se_h,
+         ci_low = coef_h - CI_Z * se_h, ci_high = coef_h + CI_Z * se_h)
+}) %>% bind_rows()
+
+fml_og <- as.formula(
+  "d_pb_gdp ~ unemp_rate_lag + gdp_growth_rate_lag + infl_core_lag1 +
+   primary_bal_gdp_ratio_lag + debt_gdp_ratio_lag1 + output_gap_lag |
+   geo + quarter"
+)
+result_og     <- fit_and_recover(fml_og, df_panel, "u_hat_og")
+df_panel      <- result_og$panel
+df_lp$u_hat_og <- df_panel$u_hat_og[
+  match(paste(df_lp$geo, df_lp$quarter),
+        paste(df_panel$geo, df_panel$quarter))]
+irf_og <- run_lp(df_lp, "u_hat_og", c(lp_controls, "output_gap_lag"),
+                 H_QUARTERLY)
+
+final_cor <- cor(df_panel$d_pb_gdp, df_panel$u_hat,
+                 use = "pairwise.complete.obs")
+cat(sprintf("  Final u_hat integrity: %.4f (was %.4f) — %s\n",
+            final_cor, baseline_cor_check,
+            ifelse(abs(final_cor - baseline_cor_check) < 0.001,
+                   "OK", "WARNING: CHANGED")))
+
+cat("  Running leave-one-out (h = 6)...\n")
+loo_h6 <- map_dfr(EA12, function(ctry) {
+  fit <- tryCatch(
+    feols(infl_core_h6 ~ u_hat + debt_gdp_ratio_lag1 + gdp_growth_rate_lag +
+            unemp_rate_lag + primary_bal_gdp_ratio_lag | geo + quarter,
+          data = filter(df_lp, geo != ctry), cluster = ~geo),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(tibble(dropped = ctry, estimate = NA_real_, se = NA_real_))
+  tibble(dropped = ctry, estimate = coef(fit)["u_hat"], se = se(fit)["u_hat"])
+})
+cat("\n--- Leave-one-out: h = 6 ---\n")
+print(loo_h6)
+
+rob_combined <- bind_rows(
+  irf_baseline %>% mutate(spec = "Baseline"),
+  irf_weighted %>% mutate(spec = "GDP-weighted"),
+  irf_level    %>% mutate(spec = "Level shock"),
+  irf_og       %>% mutate(spec = "Output gap")
+)
+
+p_rob <- ggplot(rob_combined,
+                aes(x = horizon, y = estimate, color = spec, fill = spec)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+  scale_x_continuous(breaks = 0:H_QUARTERLY) +
+  scale_color_manual(values = c("steelblue","tomato","darkgreen","purple")) +
+  scale_fill_manual(values  = c("steelblue","tomato","darkgreen","purple")) +
+  labs(title    = "Robustness: Core Inflation LP Across Specifications",
+       subtitle = paste0(CI_LABEL, " | All use country + time FE"),
+       x = "Horizon (quarters)", y = "Response of core inflation (pp)",
+       color = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+print(p_rob)
+ggsave("figures/robustness/fig4_robustness.jpg", p_rob, width = 10, height = 5)
+```
+
+# DONE
+
+```{r done}
+# ══════════════════════════════════════════════════════════════════════════════
+# DONE
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n", strrep("=", 60), "\n")
+cat("All sections complete.\n\n")
+cat("Context figures:    figC1_ea_inflation.jpg\n")
+cat("                    figC2_ea_pb_gdp.jpg\n")
+cat("                    figC3_ea_debt_gdp.jpg\n")
+cat("                    figC4_ea_unemp.jpg\n")
+cat("                    figC5_context_panel.jpg\n")
+cat("                    figC6_core_infl_by_country.jpg\n")
+cat("                    figC7_debt_by_country.jpg\n")
+cat("                    figC8_pb_by_country.jpg\n")
+cat("                    figC9_scatter_debt_infl.jpg\n")
+cat("Shock comparison:   fig_shock_gdp_vs_debt.jpg\n")
+cat("Main LP figures:    fig3_spf_horizon_lp.jpg (GDP-wt)\n")
+cat("                    fig3b_spf_horizon_lp_debt.jpg (Debt-wt)\n")
+cat("                    fig_compare_weights_5yr.jpg\n")
+cat("Sub-period LPs:     fig_subperiods_5yr.jpg (GDP-wt)\n")
+cat("                    fig_subperiods_5yr_debt.jpg (Debt-wt)\n")
+cat("Robustness:         fig4_robustness.jpg\n")
+cat(strrep("=", 60), "\n")
+```
